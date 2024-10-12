@@ -14,20 +14,18 @@ The Code Assistant RAG (Retrieval-Augmented Generation) is a Streamlit applicati
 
 1. Clone the repository:
    ```bash
-   git clone <repository-url>
-   cd <repository-directory>
+   git clone not-ekalabya/ghost
+   cd ghost
    ```
 2. Install the required packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
+
 3. Set up your environment variables for the AI model and project configuration.
 
 ## Usage
 
 1. Run the application:
    ```bash
-   streamlit run app/main.py
+   streamlit run main.py
    ```
 2. Open your web browser and navigate to `http://localhost:8501`.
 3. Enter your coding question in the text area and click "Get Answer" to receive a response.
