@@ -13,13 +13,18 @@ from pathlib import Path
 import subprocess
 import asyncio
 import git
+import base64
 
 # todo
 # Fix changes not being implemented in directory
+# Fix the UI for the answer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+GCP_PROJECT = "YOUR_GCP_PROJECT_ID"
+GCP_LOCATION = "euope-west1"
 
 
 class TextEmbedder:
@@ -102,6 +107,7 @@ class CodebaseEmbeddings:
         self.code_snippets = code_snippets
         self.embedder = embedder
         self.embeddings = None
+        self.cache_file = "codebase_cache.pkl"
 
     def compute_embeddings(self):
         if self.embeddings is None:
@@ -110,6 +116,33 @@ class CodebaseEmbeddings:
                 [snippet[1] for snippet in self.code_snippets]
             )
         return self.embeddings
+
+    def update_embeddings(self, file_path: str, content: str):
+        for i, (path, _) in enumerate(self.code_snippets):
+            if path == file_path:
+                self.code_snippets[i] = (file_path, content)
+                break
+        else:
+            self.code_snippets.append((file_path, content))
+
+        self.embeddings = None  # Reset embeddings to force recomputation
+        self.save_cache()
+
+    def delete_embedding(self, file_path: str):
+        self.code_snippets = [
+            snippet for snippet in self.code_snippets if snippet[0] != file_path
+        ]
+        self.embeddings = None  # Reset embeddings to force recomputation
+        self.save_cache()
+
+    def save_cache(self):
+        with open(self.cache_file, "wb") as f:
+            pickle.dump(self.code_snippets, f)
+
+    def reload_database(self, directory: str):
+        self.code_snippets = process_codebase(directory, cache_file=self.cache_file)
+        self.embeddings = None
+        logger.info("Vector database reloaded.")
 
 
 def retrieve_relevant_code(
@@ -157,6 +190,19 @@ class ClaudeClient:
         return response.content[0].text
 
 
+class ChatMessage:
+    def __init__(self, role: str, content: str):
+        self.role = role
+        self.content = content
+
+    def to_dict(self) -> dict[str, str]:
+        return {"role": self.role, "content": self.content}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, str]) -> "ChatMessage":
+        return cls(role=data["role"], content=data["content"])
+
+
 class RAGApplication:
     def __init__(self, codebase_directory: str, project_id: str, region: str):
         self.embedder = TextEmbedder()
@@ -164,8 +210,14 @@ class RAGApplication:
         self.codebase_embeddings = CodebaseEmbeddings(self.code_snippets, self.embedder)
         self.claude_client = ClaudeClient(project_id, region)
         self.codebase_directory = codebase_directory
+        self.chat_history: List[ChatMessage] = []
+        logger.info(
+            f"Initialized RAGApplication with codebase directory: {self.codebase_directory}"
+        )
 
-    def answer_question(self, question: str) -> str:
+    def answer_question(
+        self, question: str, images: List[Tuple[str, bytes]] = None
+    ) -> str:
         relevant_code = retrieve_relevant_code(
             question, self.codebase_embeddings, self.embedder
         )
@@ -175,13 +227,37 @@ class RAGApplication:
             context += f"File: {file_path}\nRelevance Score: {score:.2f}\n\n```\n{code}\n```\n\n"
 
         messages = [
+            *[msg.to_dict() for msg in self.chat_history],
             {
                 "role": "user",
-                "content": f"{question}\nHere is some context about the project\nContext:\n{context}\n\nOUTPUT VALID JSON",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"{question}\nHere is some context about the project\nContext:\n{context}\n\nOUTPUT VALID JSON",
+                    }
+                ],
             },
         ]
 
-        return self.claude_client.generate_response(messages)
+        # Add images to the message if provided
+        if images:
+            for img_name, img_data in images:
+                base64_image = base64.b64encode(img_data).decode("utf-8")
+                messages[-1]["content"].append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": base64_image,
+                        },
+                    }
+                )
+
+        response = self.claude_client.generate_response(messages)
+        self.chat_history.append(ChatMessage("user", question))
+        self.chat_history.append(ChatMessage("assistant", response))
+        return response
 
     def implement_changes(self, changes: List[dict]) -> List[dict]:
         results = []
@@ -193,12 +269,14 @@ class RAGApplication:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w") as f:
                     f.write(change["content"])
+                self.codebase_embeddings.update_embeddings(path, change["content"])
                 results.append({"action": action, "path": path, "status": "success"})
 
             elif action == "delete":
                 path = os.path.join(self.codebase_directory, change["path"])
                 if os.path.exists(path):
                     os.remove(path)
+                    self.codebase_embeddings.delete_embedding(path)
                     results.append(
                         {"action": action, "path": path, "status": "success"}
                     )
@@ -243,6 +321,9 @@ class RAGApplication:
 
         return results
 
+    def reload_database(self):
+        self.codebase_embeddings.reload_database(self.codebase_directory)
+
 
 system_prompt = """
 The assistant is an expert software engineer called ghost. It analyzes the given context, identifying key aspects of the project important for software engineering such as the technologies used, the purpose of the project, and how they align with the query. Ghost outputs functional and clean code which resonates with the technologies used. Ghost provides comments to write self-explaining code that can be implemented straight to the project.
@@ -272,60 +353,6 @@ Any other information is except the json is not shown.
 """
 
 
-def implement_changes(changes):
-    results = []
-    for change in changes:
-        action = change["action"]
-
-        if action == "create" or action == "modify":
-            path = change["path"]
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                f.write(change["content"])
-            results.append({"action": action, "path": path, "status": "success"})
-
-        elif action == "delete":
-            path = change["path"]
-            if os.path.exists(path):
-                os.remove(path)
-                results.append({"action": action, "path": path, "status": "success"})
-            else:
-                results.append(
-                    {
-                        "action": action,
-                        "path": path,
-                        "status": "error",
-                        "message": "File not found",
-                    }
-                )
-
-        elif action == "execute":
-            command = change["command"]
-            try:
-                result = subprocess.run(
-                    command, shell=True, check=True, capture_output=True, text=True
-                )
-                results.append(
-                    {
-                        "action": action,
-                        "command": command,
-                        "output": result.stdout,
-                        "status": "success",
-                    }
-                )
-            except subprocess.CalledProcessError as e:
-                results.append(
-                    {
-                        "action": action,
-                        "command": command,
-                        "output": e.stderr,
-                        "status": "error",
-                    }
-                )
-
-    return results
-
-
 @st.cache_resource
 def initialize_rag_application(repo_or_dir, *, is_local=False, local_dir="repo"):
     if is_local:
@@ -345,57 +372,95 @@ def initialize_rag_application(repo_or_dir, *, is_local=False, local_dir="repo")
 
         asyncio.run(clone_repo())
 
-    project_id = "GCP_PROJECT"
-    region = "GCP_LOCATION"
+    project_id = GCP_PROJECT
+    region = GCP_LOCATION
 
     return RAGApplication(str(repo_path), project_id, region)
 
 
 # Streamlit UI
-st.title("Code Assistant RAG")
+st.set_page_config(layout="wide")
+
+# Initialize session state
+if "rag_app" not in st.session_state:
+    st.session_state.rag_app = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Sidebar for project configuration
+with st.sidebar:
+    st.title("Project Configuration")
+    dir = st.text_input("Project Directory:")
+    dir_type = st.selectbox("Type of repository:", ["github", "local"])
+    if st.button("Initialize Project"):
+        st.session_state.rag_app = initialize_rag_application(
+            dir, is_local=dir_type == "local"
+        )
+        if st.session_state.rag_app:
+            st.success("Project initialized successfully!")
+        else:
+            st.error(
+                "Failed to initialize project. Please check your inputs and try again."
+            )
+
+    # Add reload database button
+    if st.session_state.rag_app and st.button("Reload Database"):
+        st.session_state.rag_app.reload_database()
+        st.success("Database reloaded successfully!")
+
+# Main chat interface
+st.title("Chat with Ghost")
+
+# Chat history display
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
 
 # User input
-dir = st.text_input("Project Directory:")
-dir_type = st.selectbox("Type of repository:", ["github", "local"])
-query = st.text_area("Enter your coding question:")
+if prompt := st.chat_input("What would you like to know?"):
+    if st.session_state.rag_app:
+        with st.chat_message("user"):
+            st.write(prompt)
 
-rag_app = initialize_rag_application(dir, is_local=dir_type == "local")
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                response = st.session_state.rag_app.answer_question(prompt)
+                st.write(response)
 
-if rag_app is None:
-    st.error(
-        "Failed to initialize RAG application. Please check your codebase directory and try again."
-    )
-else:
-    if st.button("Get Answer"):
-        if query:
-            with st.spinner("Generating answer..."):
                 try:
-                    answer = rag_app.answer_question(query)
-                    st.write("Answer:", answer)
+                    response_json = json.loads(response)
+                    if isinstance(response_json, dict) and "changes" in response_json:
+                        st.write("Proposed changes:")
+                        st.json(response_json)
 
-                    try:
-                        response_json = json.loads(answer)
-                        if (
-                            isinstance(response_json, dict)
-                            and "changes" in response_json
-                        ):
-                            st.write("Proposed changes:")
-                            st.json(response_json)
-
-                            if st.button("Implement Changes"):
-                                results = rag_app.implement_changes(
+                        if st.button("Implement Changes"):
+                            with st.spinner("Implementing changes..."):
+                                results = st.session_state.rag_app.implement_changes(
                                     response_json["changes"]
                                 )
                                 st.write("Implementation results:")
                                 st.json(results)
-                                st.success("Changes implemented successfully!")
-                        else:
-                            st.write("No changes to implement.")
-                    except json.JSONDecodeError:
-                        st.write(
-                            "The response is not in JSON format. No changes to implement."
-                        )
-                except Exception as e:
-                    st.error(f"An error occurred: {str(e)}")
-        else:
-            st.warning("Please enter a question.")
+                                if any(
+                                    result["status"] == "error" for result in results
+                                ):
+                                    st.error(
+                                        "Some changes could not be implemented. Check the results for details."
+                                    )
+                                else:
+                                    st.success("All changes implemented successfully!")
+                except json.JSONDecodeError:
+                    st.error(
+                        "The response is not in valid JSON format. No changes to implement."
+                    )
+
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        st.session_state.chat_history.append({"role": "assistant", "content": response})
+    else:
+        st.warning("Please initialize the project first using the sidebar.")
+
+# Clear chat history button
+if st.button("Clear Chat History"):
+    st.session_state.chat_history = []
+    if st.session_state.rag_app:
+        st.session_state.rag_app.chat_history = []
+    st.success("Chat history cleared!")
