@@ -1,7 +1,12 @@
 import os
 import json
 import streamlit as st
-from anthropic import AnthropicVertex, APIStatusError
+from anthropic import (
+    AnthropicVertex,
+    APIStatusError,
+    APITimeoutError,
+    APIConnectionError,
+)
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
@@ -16,11 +21,10 @@ import git
 import base64
 import difflib
 
-import pytest
 import tempfile
 import ast
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 import traceback
 
 # Set up logging
@@ -182,53 +186,18 @@ class ClaudeClient:
         self.client = AnthropicVertex(project_id=project_id, region=region)
 
     def generate_response(self, messages: List[dict]) -> str:
-        response = self.client.messages.create(
-            model="claude-3-5-sonnet@20240620",
-            system="""You are an expert software engineer called ghost. You analyze the given context and provide code modifications.
-            Your response must be in VALID JSON format with the following structure:
-            {
-                "description": "A brief description of the changes",
-                "markdown": "explanatory text",
-                "changes": [{
-                    "action": "create|modify|delete|execute",
-                    "path": "path/to/file",
-                    "content": "file_content_or_diff",
-                    "command": "shell_command"  // for execute action only
-                }],
-                "summary": "summary of changes"
-            }
-            For 'modify' actions, encode the diff content to handle newlines and special characters. Use '\\n' for newlines.
-            IMPORTANT: All strings in the JSON must be properly escaped.""",
-            max_tokens=8192,
-            messages=messages,
-        )
-
-        # Try to parse the response as JSON
         try:
-            json.loads(response.content[0].text)
-            return response.content[0].text
-        except json.JSONDecodeError:
-            # If parsing fails, try to extract JSON portion and fix common issues
-            text = response.content[0].text
+            response = self.client.messages.create(
+                model="claude-3-5-sonnet@20240620",
+                system=system_prompt,
+                max_tokens=8192,
+                messages=messages,
+            )
+
+            # Try to parse the response as JSON
             try:
-                # Find JSON-like content between curly braces
-                start = text.find("{")
-                end = text.rfind("}") + 1
-                if start >= 0 and end > start:
-                    json_str = text[start:end]
-                    # Parse to validate and re-encode properly
-                    parsed = json.loads(json_str)
-                    # Fix diff content in changes
-                    if "changes" in parsed:
-                        for change in parsed["changes"]:
-                            if "content" in change:
-                                # Properly escape newlines and special characters
-                                change["content"] = (
-                                    change["content"]
-                                    .replace("\n", "\\n")
-                                    .replace('"', '\\"')
-                                )
-                    return json.dumps(parsed, ensure_ascii=False)
+                json.loads(response.content[0].text)
+                return response.content[0].text
             except (json.JSONDecodeError, AttributeError) as e:
                 logger.error(f"Failed to fix JSON response: {e}")
                 # Return a valid JSON error response
@@ -238,6 +207,19 @@ class ClaudeClient:
                         "description": "Failed to generate valid JSON response",
                         "changes": [],
                         "summary": "No changes implemented due to response format error",
+                    }
+                )
+        except (APIStatusError, APITimeoutError, APIConnectionError) as e:
+            if "context length exceeded" in str(e).lower():
+                raise
+            else:
+                logger.error(f"API error: {str(e)}")
+                return json.dumps(
+                    {
+                        "error": "API error",
+                        "description": str(e),
+                        "changes": [],
+                        "summary": "No changes implemented due to API error",
                     }
                 )
 
@@ -349,7 +331,18 @@ class RAGApplication:
         self.codebase_embeddings = CodebaseEmbeddings(self.code_snippets, self.embedder)
         self.claude_client = ClaudeClient(project_id, region)
         self.codebase_directory = codebase_directory
-        self.chat_history: List[ChatMessage] = []
+        self.chat_history: List[ChatMessage] = [
+            {
+                "role": "user",
+                "content": "Add a text file containing an introduction about yourself.",
+            },
+            {
+                "role": "assistant",
+                "content": """
+                    {"description":"Creating a new text file with an introduction about Ghost, the AI assistant.","markdown":"I'm adding a new text file named 'ghost_introduction.txt' in the root directory. This file will contain a brief introduction about myself, Ghost, the AI assistant specialized in software engineering.","changes":[{"action":"create","path":"ghost_introduction.txt","content":"Hello, I'm Ghost!\n\nI'm an AI assistant specialized in software engineering. My primary function is to help developers with various programming tasks, code analysis, and project management. Here are a few things about me:\n\n1. I'm well-versed in multiple programming languages and frameworks.\n2. I can analyze code, suggest improvements, and help debug issues.\n3. I provide clear explanations and comments in the code I generate.\n4. I can assist with project structure and best practices.\n5. I'm constantly learning and updating my knowledge base.\n\nFeel free to ask me any software engineering related questions or for help with your coding projects. I'm here to assist you in creating efficient, clean, and functional code!"},{"action":"execute","path":".","command":"cat ghost_introduction.txt"}],"summary":"Created a new file 'ghost_introduction.txt' with an introduction about Ghost, the AI assistant specialized in software engineering. The file has been created in the root directory, and its contents have been displayed using the 'cat' command."}
+                """,
+            },
+        ]
         logger.info(
             f"Initialized RAGApplication with codebase directory: {self.codebase_directory}"
         )
@@ -360,29 +353,53 @@ class RAGApplication:
         max_attempts = attempts
         attempt = 0
         last_response_json = None
+        messages = self.chat_history + [
+            {"role": "user", "content": [{"type": "text", "text": question}]}
+        ]
 
         while attempt < max_attempts:
             try:
                 # Get initial response
-                response = self.claude_client.generate_response(
-                    [{"role": "user", "content": [{"type": "text", "text": question}]}]
-                )
+                response = self.claude_client.generate_response(messages)
                 response_json = json.loads(response)
                 last_response_json = response_json  # Store the last response
 
-                # Execute the program
-                execution_result = self._execute_program(response_json)
+                # Check if execution is needed
+                if self._should_execute(response_json):
+                    execution_result = self._execute_program(response_json)
 
-                if execution_result.success:
-                    return json.dumps(response_json)
+                    if not execution_result.success:
+                        # If execution failed, get fixes
+                        fix_prompt = self._generate_fix_prompt(
+                            response_json, execution_result
+                        )
+                        messages.append({"role": "user", "content": fix_prompt})
 
-                # If execution failed, get fixes
-                fix_prompt = self._generate_fix_prompt(response_json, execution_result)
-                response = self.claude_client.generate_response(
-                    [{"role": "user", "content": fix_prompt}]
+                        try:
+                            response = self.claude_client.generate_response(messages)
+                        except (
+                            APIStatusError,
+                            APITimeoutError,
+                            APIConnectionError,
+                        ) as e:
+                            if "context length exceeded" in str(e).lower():
+                                # Truncate chat history and try again
+                                messages = self._truncate_chat_history(messages)
+                                response = self.claude_client.generate_response(
+                                    messages
+                                )
+                            else:
+                                raise
+
+                        attempt += 1
+                        continue
+
+                # If we reach here, either execution was successful or not needed
+                self.chat_history.append(
+                    {"role": "user", "content": [{"type": "text", "text": question}]}
                 )
-
-                attempt += 1
+                self.chat_history.append({"role": "assistant", "content": response})
+                return json.dumps(response_json)
 
             except Exception as e:
                 logger.error(f"Error in execution cycle: {str(e)}")
@@ -417,10 +434,25 @@ class RAGApplication:
 
         return json.dumps(final_response)
 
+    def _truncate_chat_history(self, messages: List[dict]) -> List[dict]:
+        """Truncate chat history to reduce context length."""
+        if len(messages) <= 2:
+            return messages
+
+        # Remove the oldest message that is not the system message
+        return [messages[0]] + messages[2:]
+
+    def _should_execute(self, response_json: dict) -> bool:
+        """Check if the last change in the response is an execute command."""
+        if "changes" in response_json and response_json["changes"]:
+            last_change = response_json["changes"][-1]
+            return last_change.get("action") == "execute"
+        return False
+
     def _execute_program(self, response_json: dict) -> TestResult:
         """Execute the program and return the result"""
         execute_command = None
-        for change in response_json["changes"]:
+        for change in reversed(response_json["changes"]):
             if change["action"] == "execute":
                 execute_command = change["command"]
                 break
@@ -665,6 +697,7 @@ Ghost can also process and analyze images provided in the conversation. When ima
 
 Ghost outputs its response in the form of a JSON object with the following structure:
 
+"
 {
     "description": "A brief description of the response or changes",
     "markdown": "Detailed explanation or response content",
@@ -675,11 +708,23 @@ Ghost outputs its response in the form of a JSON object with the following struc
             "content": "New or modified content of the file in diff format",
             "command": "Shell command to execute"
         }
+        .
+        .
+        .
+        .
+        {
+            "action": "execute",
+            "path": "path/to/execution",
+            "command": "command to execute the program (ex. npm run dev)"
+        }
     ],
     "summary": "A summary of the response or changes implemented"
 }
+"
 
 The 'changes' array should only be included when code modifications or executions are necessary. For non-code-related queries, the 'changes' array can be empty or omitted.
+
+For programming based tasks always include a execute method at the end which runs the code that is written.
 
 For code-related queries:
 - Use the 'create', 'modify', or 'delete' actions for file operations.
@@ -690,8 +735,7 @@ For non-code-related queries:
 - Provide an appropriate response in the 'markdown' field.
 - Do not include unnecessary 'execute' actions or empty 'changes' arrays.
 
-GHOST OUTPUTS ONLY IN VALID JSON FORMAT. THE OUTPUT CAN BE READILY PARSED AS A JSON OBJECT.
-Any other information except the JSON is not shown.
+OUTPUT ONLY IN VALID JSON FORMAT. THE OUTPUT CAN BE READILY PARSED AS A JSON OBJECT.
 """
 
 
@@ -786,14 +830,20 @@ if prompt := st.chat_input("What would you like to know?"):
                 try:
                     response_json = json.loads(response)
                     if isinstance(response_json, dict) and "changes" in response_json:
-                        st.write("Proposed changes:")
+                        try:
+                            st.write(response_json["markdown"])
+                            st.write(response_json["summary"])
+                        except:
+                            st.json(response_json)
+
                         st.json(response_json)
                         with st.spinner("Implementing changes..."):
                             results = st.session_state.rag_app.implement_changes(
                                 response_json["changes"]
                             )
-                            st.write("Implementation results:")
-                            st.json(results)
+                            if results != []:
+                                st.write("#### Implementation")
+                                st.json(results, expanded=False)
                             if any(result["status"] == "error" for result in results):
                                 st.error(
                                     "Some changes could not be implemented. Check the results for details."
