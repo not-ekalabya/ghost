@@ -31,16 +31,9 @@ import traceback
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
-# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# SETUP GCP PROJECT AT 756
+# SETUP GCP PROJECT AT 756
+# SETUP GCP PROJECT AT 756
 
 
 class TextEmbedder:
@@ -66,10 +59,10 @@ class TextEmbedder:
 def process_codebase(
     directory: str, cache_file: str = "codebase_cache.pkl"
 ) -> List[Tuple[str, str]]:
-    if os.path.exists(cache_file):
-        logger.info("Loading codebase from cache...")
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
+    # if os.path.exists(cache_file):
+    #     logger.info("Loading codebase from cache...")
+    #     with open(cache_file, "rb") as f:
+    #         return pickle.load(f)
 
     code_snippets = []
     ignored_dirs = {"node_modules", "__pycache__", ".git", "venv", "env"}
@@ -171,9 +164,7 @@ def retrieve_relevant_code(
         logger.warning("No code snippets found in the codebase.")
         return []
 
-    query_with_instruction = (
-        f"Represent this sentence for retrieving relevant code snippets: {query}"
-    )
+    query_with_instruction = f"'{query}' - This is a prompt given to a software engineer. Represent all the reference code the engineer needs. Always mention the name of the file and the class and function ( if any ) with the respective code snippets"
     query_embedding = embedder.embed([query_with_instruction])
 
     code_embeddings = codebase_embeddings.compute_embeddings()
@@ -206,6 +197,7 @@ class ClaudeClient:
             )
 
             # Try to parse the response as JSON
+            # print(response.content[0].text)
             return response.content[0].text
 
         except (APIStatusError, APITimeoutError, APIConnectionError) as e:
@@ -360,7 +352,7 @@ class RAGApplication:
             try:
                 # Get initial response
                 response = self.claude_client.generate_response(messages)
-                response_json = json.loads(response.replace("\n", ""))
+                response_json = json.loads(response, strict=False)
                 last_response_json = response_json  # Store the last response
 
                 # Check if execution is needed
@@ -688,42 +680,45 @@ Please provide fixed changes that will execute successfully. Respond in the same
 
 
 system_prompt = """
-The assistant is an expert software engineer called ghost. It analyzes the given context, identifying key aspects of the project important for software engineering such as the technologies used, the purpose of the project, and how they align with the query. Ghost outputs functional and clean code which resonates with the technologies used. Ghost provides comments to write self-explaining code that can be implemented straight to the project.
+<role>
+The assistant is an expert software engineer called ghost. It analyzes the given context, identifying key aspects of the project important for software engineering such as the technologies used, the purpose of the project, and how they align with the query. Ghost outputs functional and clean code which resonates with the technologies used. 
+
+Ghost provides comments to write self-explaining code that can be implemented straight to the project.
 
 Ghost can execute shell commands in its directory when necessary. When a shell command needs to be executed, Ghost will include it in the JSON response as part of the changes.
 
 Ghost can also process and analyze images provided in the conversation. When images are present, Ghost will consider them in the context of the query and provide relevant insights or code modifications based on the image content.
 
+Before landing on a response, Ghost always thinks about the question and shows its thinking process adressing the issues that may arise. It explores several solutions and analyzes them to land on the best one that aligns the most with the project background and the query.
+
+</role>
+
+<format>
+
 Ghost outputs its response in the form of a JSON object with the following structure:
 
-"
 {
     "description": "A brief description of the response or changes",
     "markdown": "Detailed explanation or response content",
-    "changes": [
+    "changes": [ // if necessary
         {
             "action": "create|modify|delete|execute",
             "path": "path/to/file",
             "content": "New or modified content of the file in diff format",
             "command": "Shell command to execute"
         }
-        .
-        .
-        .
-        .
-        {
-            "action": "execute",
-            "path": "path/to/execution",
-            "command": "command to execute the program (ex. npm run dev)"
-        }
     ],
     "summary": "A summary of the response or changes implemented"
 }
-"
 
-The 'changes' array should only be included when code modifications or executions are necessary. For non-code-related queries, the 'changes' array can be empty or omitted.
+</format>
 
-For programming based tasks always include a execute method at the end which runs the code that is written.
+<important>
+Leave the changes array empty for non-code related tasks such as - "Can you write a detailed background about this project?" or "What technologies does this project use?". In case of questions like these respond in the "markdown" key of the JSON object without executing changes.
+</important>
+
+<notes>
+For programming based tasks always include a execute method at the end which tests if the project works with the implemented changes.
 
 For code-related queries:
 - Use the 'create', 'modify', or 'delete' actions for file operations.
@@ -735,6 +730,8 @@ For non-code-related queries:
 - Do not include unnecessary 'execute' actions or empty 'changes' arrays.
 
 OUTPUT ONLY IN VALID JSON FORMAT. THE OUTPUT CAN BE READILY PARSED AS A JSON OBJECT.
+</notes>
+
 """
 
 
@@ -757,7 +754,7 @@ def initialize_rag_application(repo_or_dir, *, is_local=False, local_dir="repo")
 
         asyncio.run(clone_repo())
 
-    project_id = "ghost-widget-7000"
+    project_id = "YOUR_GCP_PROJECT"
     region = "europe-west1"
 
     return RAGApplication(str(repo_path), project_id, region)
