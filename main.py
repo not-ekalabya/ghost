@@ -31,6 +31,17 @@ import traceback
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+# IMPORATANT: GO TO LINE 760 FOR PROJECT CONFIGURATION -----------------------------------------------------------------------------
+
 
 class TextEmbedder:
     def __init__(self, model_name="BAAI/bge-large-en-v1.5"):
@@ -758,7 +769,7 @@ def initialize_rag_application(repo_or_dir, *, is_local=False, local_dir="repo")
 
         asyncio.run(clone_repo())
 
-    project_id = "ghost-widget-7000"
+    project_id = "YOUR_GCP_PROJECT"
     region = "europe-west1"
 
     return RAGApplication(str(repo_path), project_id, region)
