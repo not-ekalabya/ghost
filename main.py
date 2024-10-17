@@ -206,20 +206,8 @@ class ClaudeClient:
             )
 
             # Try to parse the response as JSON
-            try:
-                json.loads(response.content[0].text)
-                return response.content[0].text
-            except (json.JSONDecodeError, AttributeError) as e:
-                logger.error(f"Failed to fix JSON response: {e}")
-                # Return a valid JSON error response
-                return json.dumps(
-                    {
-                        "error": "Invalid response format",
-                        "description": "Failed to generate valid JSON response",
-                        "changes": [],
-                        "summary": "No changes implemented due to response format error",
-                    }
-                )
+            return response.content[0].text
+
         except (APIStatusError, APITimeoutError, APIConnectionError) as e:
             if "context length exceeded" in str(e).lower():
                 raise
@@ -372,7 +360,7 @@ class RAGApplication:
             try:
                 # Get initial response
                 response = self.claude_client.generate_response(messages)
-                response_json = json.loads(response)
+                response_json = json.loads(response.replace("\n", ""))
                 last_response_json = response_json  # Store the last response
 
                 # Check if execution is needed
@@ -769,7 +757,7 @@ def initialize_rag_application(repo_or_dir, *, is_local=False, local_dir="repo")
 
         asyncio.run(clone_repo())
 
-    project_id = "YOUR_GCP_PROJECT"
+    project_id = "ghost-widget-7000"
     region = "europe-west1"
 
     return RAGApplication(str(repo_path), project_id, region)
