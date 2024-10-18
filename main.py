@@ -18,7 +18,6 @@ from pathlib import Path
 import subprocess
 import asyncio
 import git
-import base64
 import difflib
 
 import tempfile
@@ -754,7 +753,7 @@ def initialize_rag_application(repo_or_dir, *, is_local=False, local_dir="repo")
 
         asyncio.run(clone_repo())
 
-    project_id = "YOUR_GCP_PROJECT"
+    project_id = "ghost-widget-7000"
     region = "europe-west1"
 
     return RAGApplication(str(repo_path), project_id, region)
@@ -819,8 +818,22 @@ if prompt := st.chat_input("What would you like to know?"):
                     if file.type.startswith("image/")
                 ]
 
+                codebase = process_codebase(dir)
+                embedder = TextEmbedder()
+
+                codebase_embeddings = CodebaseEmbeddings(
+                    code_snippets=codebase, embedder=embedder
+                )
+                relevant = retrieve_relevant_code(
+                    query=prompt,
+                    codebase_embeddings=codebase_embeddings,
+                    embedder=embedder,
+                )
+
                 response = st.session_state.rag_app.answer_question(
-                    prompt, images, max_attempts
+                    f"{prompt}\n\n Here is the relevant context you would need about the project-\n {relevant}\n\n Note: The relevant context is provided in form of a list of tuples. Each tuple has 3 values in this specific order - (<path to the file>, <content of the file>, <relevance of the file in the range 0-1>)",
+                    images,
+                    max_attempts,
                 )
 
                 try:
