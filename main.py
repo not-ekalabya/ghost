@@ -25,14 +25,15 @@ import ast
 from dataclasses import dataclass
 from typing import List, Dict, Any
 import traceback
+import re
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# SETUP GCP PROJECT AT 756
-# SETUP GCP PROJECT AT 756
-# SETUP GCP PROJECT AT 756
+# SETUP GCP PROJECT AT 784
+# SETUP GCP PROJECT AT 784
+# SETUP GCP PROJECT AT 784
 
 
 class TextEmbedder:
@@ -197,6 +198,7 @@ class ClaudeClient:
 
             # Try to parse the response as JSON
             # print(response.content[0].text)
+            logger.info(f"claude client: {response.content[0].text}")
             return response.content[0].text
 
         except (APIStatusError, APITimeoutError, APIConnectionError) as e:
@@ -311,6 +313,34 @@ class TestRunner:
                 error_message=f"Syntax error: {str(e)}",
                 traceback=traceback.format_exc(),
             )
+
+
+def extract_json(response):
+    # Try to find JSON-like content within curly braces
+    json_pattern = r"\{(?:[^{}]|(?R))*\}"
+    potential_json = re.findall(json_pattern, response, re.DOTALL)
+
+    # If no JSON-like content is found, return None
+    if not potential_json:
+        return None
+
+    # Try to parse each potential JSON string
+    for json_str in potential_json:
+        try:
+            # Attempt to parse the JSON
+            json_obj = json.loads(json_str)
+            return json_obj
+        except json.JSONDecodeError:
+            # If parsing fails, try to clean up the string and parse again
+            cleaned_json_str = re.sub(r"([{,]\s*)(\w+)(\s*:)", r'\1"\2"\3', json_str)
+            try:
+                json_obj = json.loads(cleaned_json_str)
+                return json_obj
+            except json.JSONDecodeError:
+                continue  # Move to the next potential JSON string if parsing fails
+
+    # If no valid JSON is found, return None
+    return None
 
 
 class RAGApplication:
@@ -688,8 +718,6 @@ Ghost can execute shell commands in its directory when necessary. When a shell c
 
 Ghost can also process and analyze images provided in the conversation. When images are present, Ghost will consider them in the context of the query and provide relevant insights or code modifications based on the image content.
 
-Before landing on a response, Ghost always thinks about the question and shows its thinking process adressing the issues that may arise. It explores several solutions and analyzes them to land on the best one that aligns the most with the project background and the query.
-
 </role>
 
 <format>
@@ -753,7 +781,7 @@ def initialize_rag_application(repo_or_dir, *, is_local=False, local_dir="repo")
 
         asyncio.run(clone_repo())
 
-    project_id = "ghost-widget-7000"
+    project_id = "YOUR_GCP_PROJECT_ID"
     region = "europe-west1"
 
     return RAGApplication(str(repo_path), project_id, region)
@@ -837,7 +865,7 @@ if prompt := st.chat_input("What would you like to know?"):
                 )
 
                 try:
-                    response_json = json.loads(response)
+                    response_json = extract_json(response, strict=False)
                     if isinstance(response_json, dict) and "changes" in response_json:
                         try:
                             st.write(response_json["markdown"])
