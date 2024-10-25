@@ -66,6 +66,13 @@ def process_codebase(
 
     code_snippets = []
     ignored_dirs = {"node_modules", "__pycache__", ".git", "venv", "env"}
+    ignored_files = {
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        ".gitignore",
+        ".env",
+    }
     allowed_extensions = {
         ".py",
         ".js",
@@ -88,10 +95,27 @@ def process_codebase(
         ".md",
     }
 
+    # First check for README files
+    readme_paths = [
+        os.path.join(directory, f) for f in ["README.md", "Readme.md", "readme.md"]
+    ]
+    for readme_path in readme_paths:
+        if os.path.exists(readme_path):
+            try:
+                with open(readme_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                code_snippets.append((readme_path, content))
+                logger.info(f"Added README file: {readme_path}")
+                break
+            except Exception as e:
+                logger.error(f"Error reading README file {readme_path}: {e}")
+
     logger.info(f"Scanning directory: {directory}")
     for root, dirs, files in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in ignored_dirs]
         for file in files:
+            if file in ignored_files:
+                continue
             file_path = os.path.join(root, file)
             _, ext = os.path.splitext(file)
             if ext.lower() in allowed_extensions:
@@ -229,115 +253,52 @@ class ChatMessage:
         return cls(role=data["role"], content=data["content"])
 
 
-@dataclass
-class TestResult:
-    success: bool
-    error_message: str = None
-    traceback: str = None
-    output: str = None
-
-
-class TestRunner:
-    def __init__(self, codebase_directory: str):
-        self.codebase_directory = codebase_directory
-        self.temp_test_dir = tempfile.mkdtemp()
-
-    def generate_test_file(self, test_specs: List[dict]) -> str:
-        """Generate a pytest file from test specifications"""
-        test_content = ["import pytest", "import sys", "import os", ""]
-
-        # Add path to system path to import project modules
-        test_content.append(f"sys.path.append('{self.codebase_directory}')")
-
-        for spec in test_specs:
-            if spec["type"] == "unit":
-                test_content.extend(self._generate_unit_test(spec))
-            elif spec["type"] == "integration":
-                test_content.extend(self._generate_integration_test(spec))
-
-        test_path = os.path.join(self.temp_test_dir, "test_generated.py")
-        with open(test_path, "w") as f:
-            f.write("\n".join(test_content))
-
-        return test_path
-
-    def _generate_unit_test(self, spec: dict) -> List[str]:
-        """Generate a unit test from specification"""
-        test_lines = []
-        test_lines.append(f"\n\ndef test_{spec['name']}():")
-
-        # Add imports
-        if "imports" in spec:
-            for imp in spec["imports"]:
-                test_lines.append(f"    {imp}")
-
-        # Add setup
-        if "setup" in spec:
-            test_lines.extend(f"    {line}" for line in spec["setup"])
-
-        # Add assertions
-        for assertion in spec["assertions"]:
-            test_lines.append(f"    {assertion}")
-
-        return test_lines
-
-    def run_tests(self, test_path: str) -> TestResult:
-        """Run the generated tests and return results"""
-        try:
-            # Run pytest programmatically
-            import pytest
-
-            result = pytest.main(["-v", test_path])
-
-            if result == 0:  # All tests passed
-                return TestResult(success=True, output="All tests passed successfully")
-            else:
-                return TestResult(
-                    success=False,
-                    error_message="Some tests failed",
-                    output=f"Pytest exit code: {result}",
-                )
-        except Exception as e:
-            return TestResult(
-                success=False, error_message=str(e), traceback=traceback.format_exc()
-            )
-
-    def validate_code_statically(self, code: str) -> TestResult:
-        """Perform static code analysis"""
-        try:
-            ast.parse(code)  # Check if code is syntactically valid
-            return TestResult(success=True)
-        except SyntaxError as e:
-            return TestResult(
-                success=False,
-                error_message=f"Syntax error: {str(e)}",
-                traceback=traceback.format_exc(),
-            )
-
-
 def extract_json(response):
-    # Try to find JSON-like content within curly braces
-    json_pattern = r"\{(?:[^{}]|(?R))*\}"
-    potential_json = re.findall(json_pattern, response, re.DOTALL)
+    # Initialize variables to track braces and JSON candidates
+    stack = []
+    json_candidates = []
+    current_candidate = ""
+
+    # Iterate through each character in the response
+    for char in response:
+        if char == "{":
+            # Start a new JSON candidate if stack is empty
+            if not stack:
+                current_candidate = char
+            else:
+                current_candidate += char
+            stack.append(char)
+        elif char == "}":
+            if stack:
+                current_candidate += char
+                stack.pop()
+                # If stack is empty, we found a complete JSON candidate
+                if not stack:
+                    json_candidates.append(current_candidate)
+                    current_candidate = ""
+        else:
+            # Add characters to current candidate if within braces
+            if stack:
+                current_candidate += char
 
     # If no JSON-like content is found, return None
-    if not potential_json:
+    if not json_candidates:
         return None
 
     # Try to parse each potential JSON string
-    for json_str in potential_json:
+    for json_str in json_candidates:
         try:
             # Attempt to parse the JSON
             json_obj = json.loads(json_str)
             return json_obj
         except json.JSONDecodeError:
-            # If parsing fails, try to clean up the string and parse again
+            # If parsing fails, clean up and try again
             cleaned_json_str = re.sub(r"([{,]\s*)(\w+)(\s*:)", r'\1"\2"\3', json_str)
             try:
-                json_obj = json.loads(cleaned_json_str)
+                json_obj = json.loads(cleaned_json_str, strict=False)
                 return json_obj
             except json.JSONDecodeError:
-                continue  # Move to the next potential JSON string if parsing fails
+                continue  # Move to the next candidate if parsing fails
 
     # If no valid JSON is found, return None
     return None
@@ -351,18 +312,8 @@ class RAGApplication:
         self.codebase_embeddings = CodebaseEmbeddings(self.code_snippets, self.embedder)
         self.claude_client = ClaudeClient(project_id, region)
         self.codebase_directory = codebase_directory
-        self.chat_history: List[ChatMessage] = [
-            {
-                "role": "user",
-                "content": "Add a text file containing an introduction about yourself.",
-            },
-            {
-                "role": "assistant",
-                "content": """
-                    {"description":"Creating a new text file with an introduction about Ghost, the AI assistant.","markdown":"I'm adding a new text file named 'ghost_introduction.txt' in the root directory. This file will contain a brief introduction about myself, Ghost, the AI assistant specialized in software engineering.","changes":[{"action":"create","path":"ghost_introduction.txt","content":"Hello, I'm Ghost!\n\nI'm an AI assistant specialized in software engineering. My primary function is to help developers with various programming tasks, code analysis, and project management. Here are a few things about me:\n\n1. I'm well-versed in multiple programming languages and frameworks.\n2. I can analyze code, suggest improvements, and help debug issues.\n3. I provide clear explanations and comments in the code I generate.\n4. I can assist with project structure and best practices.\n5. I'm constantly learning and updating my knowledge base.\n\nFeel free to ask me any software engineering related questions or for help with your coding projects. I'm here to assist you in creating efficient, clean, and functional code!"},{"action":"execute","path":".","command":"cat ghost_introduction.txt"}],"summary":"Created a new file 'ghost_introduction.txt' with an introduction about Ghost, the AI assistant specialized in software engineering. The file has been created in the root directory, and its contents have been displayed using the 'cat' command."}
-                """,
-            },
-        ]
+        # Initialize with empty chat history
+        self.chat_history = []
         logger.info(
             f"Initialized RAGApplication with codebase directory: {self.codebase_directory}"
         )
@@ -373,83 +324,64 @@ class RAGApplication:
         max_attempts = attempts
         attempt = 0
         last_response_json = None
-        messages = self.chat_history + [
-            {"role": "user", "content": [{"type": "text", "text": question}]}
+
+        # Convert chat history to format expected by Claude
+        formatted_messages = [
+            {"role": msg["role"], "content": [{"type": "text", "text": msg["content"]}]}
+            for msg in self.chat_history
         ]
+
+        # Add current question with a note about context availability
+        question_with_note = f"{question}\n\nNote: If you need context about the     codebase, you can request it by responding with a JSON that includes     'needs_context': true"
+        formatted_messages.append(
+            {"role": "user", "content": [{"type": "text", "text": question_with_note}]}
+        )
 
         while attempt < max_attempts:
             try:
-                # Get initial response
-                response = self.claude_client.generate_response(messages)
-                response_json = json.loads(response, strict=False)
-                last_response_json = response_json  # Store the last response
+                response = self.claude_client.generate_response(formatted_messages)
+                response_json = extract_json(response)
 
-                # Check if execution is needed
-                if self._should_execute(response_json):
-                    execution_result = self._execute_program(response_json)
+                if response_json and response_json.get("needs_context"):
+                    # Model requested context, so let's provide it
+                    embedder = TextEmbedder()
+                    codebase_embeddings = CodebaseEmbeddings(
+                        self.code_snippets, embedder
+                    )
+                    relevant = retrieve_relevant_code(
+                        query=question,
+                        codebase_embeddings=codebase_embeddings,
+                        embedder=embedder,
+                    )
 
-                    if not execution_result.success:
-                        # If execution failed, get fixes
-                        fix_prompt = self._generate_fix_prompt(
-                            response_json, execution_result
-                        )
-                        messages.append({"role": "user", "content": fix_prompt})
+                    context_message = f"Here is the relevant context about the     project:\n{relevant}\n\nNote: The relevant context is provided     in form of a list of tuples. Each tuple has 3 values in this     specific order - (<path to the file>, <content of the file>,     <relevance of the file in the range 0-1>)"
+                    formatted_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": context_message}],
+                        }
+                    )
+                    continue  # Retry with context
 
-                        try:
-                            response = self.claude_client.generate_response(messages)
-                        except (
-                            APIStatusError,
-                            APITimeoutError,
-                            APIConnectionError,
-                        ) as e:
-                            if "context length exceeded" in str(e).lower():
-                                # Truncate chat history and try again
-                                messages = self._truncate_chat_history(messages)
-                                response = self.claude_client.generate_response(
-                                    messages
-                                )
-                            else:
-                                raise
+                if response_json:
+                    # Update chat history with the successful exchange
+                    self.chat_history.append({"role": "user", "content": question})
+                    self.chat_history.append({"role": "assistant", "content": response})
+                    return json.dumps(response_json)
 
-                        attempt += 1
-                        continue
-
-                # If we reach here, either execution was successful or not needed
-                self.chat_history.append(
-                    {"role": "user", "content": [{"type": "text", "text": question}]}
-                )
-                self.chat_history.append({"role": "assistant", "content": response})
-                return json.dumps(response_json)
+                attempt += 1
+                last_response_json = response_json
 
             except Exception as e:
-                logger.error(f"Error in execution cycle: {str(e)}")
-                execution_result = TestResult(
-                    success=False,
-                    error_message=str(e),
-                    traceback=traceback.format_exc(),
-                )
+                logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
                 attempt += 1
+                continue
 
         # If we've exhausted attempts, return the last response with error info
         final_response = last_response_json or {
             "description": "Failed to process request",
             "changes": [],
             "summary": "Error occurred during processing",
-        }
-
-        final_response["execution_status"] = {
-            "success": False,
-            "error": "Maximum retry attempts reached",
-            "last_execution_results": (
-                execution_result.__dict__
-                if execution_result
-                else {
-                    "success": False,
-                    "error_message": "No execution results available",
-                    "traceback": None,
-                    "output": None,
-                }
-            ),
         }
 
         return json.dumps(final_response)
@@ -469,110 +401,104 @@ class RAGApplication:
             return last_change.get("action") == "execute"
         return False
 
-    def _execute_program(self, response_json: dict) -> TestResult:
-        """Execute the program and return the result"""
-        execute_command = None
-        for change in reversed(response_json["changes"]):
-            if change["action"] == "execute":
-                execute_command = change["command"]
-                break
-
-        if not execute_command:
-            return TestResult(
-                success=False,
-                error_message="No execute command found in the response",
-            )
-
-        try:
-            result = subprocess.run(
-                execute_command,
-                shell=True,
-                check=True,
-                capture_output=True,
-                text=True,
-                cwd=self.codebase_directory,
-            )
-            return TestResult(success=True, output=result.stdout)
-        except subprocess.CalledProcessError as e:
-            return TestResult(
-                success=False,
-                error_message=f"Command failed with exit code {e.returncode}",
-                traceback=e.stderr,
-                output=e.stdout,
-            )
-
-    def _generate_fix_prompt(
-        self, response_json: dict, execution_result: TestResult
-    ) -> str:
-        """Generate prompt for fixing failed execution"""
-        return f"""The following changes failed execution:
-
-Changes:
-{json.dumps(response_json['changes'], indent=2)}
-
-Execution Results:
-Error: {execution_result.error_message}
-Traceback: {execution_result.traceback}
-Output: {execution_result.output}
-
-Please provide fixed changes that will execute successfully. Respond in the same JSON format as before."""
-
-    def parse_unified_diff(self, diff_text: str) -> List[Tuple[str, str, int]]:
-        """Parse a unified diff format string into a list of changes."""
-        # Handle escaped newlines in the diff text
-        diff_text = diff_text.replace("\\n", "\n")
+    def parse_unified_diff(self, diff_text: str) -> List[Tuple[str, str, int, str]]:
+        """Enhanced parse_unified_diff with better handling of complex diffs"""
+        # Handle escaped newlines and quotes
+        diff_text = diff_text.replace("\\n", "\n").replace('\\"', '"')
         changes = []
         current_line = 0
+        current_chunk = []
+        in_chunk = False
 
         for line in diff_text.splitlines():
+            # Handle diff headers
+            if line.startswith("---") or line.startswith("+++"):
+                continue
+
+            # Handle chunk headers
             if line.startswith("@@"):
+                if in_chunk and current_chunk:
+                    # Process previous chunk
+                    changes.extend(self._process_chunk(current_chunk, current_line))
+                    current_chunk = []
+
                 try:
+                    # Parse the chunk header
                     header = line.split("@@")[1].strip()
                     _, new = header.split(" ")
                     current_line = int(new.split(",")[0].lstrip("+")) - 1
+                    in_chunk = True
                     continue
                 except (IndexError, ValueError):
                     logger.error(f"Failed to parse diff header: {line}")
                     continue
 
-            if not line.startswith(("+++", "---")):
-                if line.startswith("+"):
-                    changes.append(("add", line[1:], current_line))
+            if in_chunk:
+                current_chunk.append((line, current_line))
+                if not line.startswith(("+", "-")):
                     current_line += 1
-                elif line.startswith("-"):
-                    changes.append(("remove", line[1:], current_line))
-                else:
-                    current_line += 1
+
+        # Process the last chunk
+        if current_chunk:
+            changes.extend(self._process_chunk(current_chunk, current_line))
+
+        return changes
+
+    def _process_chunk(
+        self, chunk: List[Tuple[str, int]], start_line: int
+    ) -> List[Tuple[str, str, int, str]]:
+        """Process a single chunk of diff and return the changes"""
+        changes = []
+        current_line = start_line
+
+        for line, _ in chunk:
+            if line.startswith("+"):
+                changes.append(("add", line[1:], current_line, ""))
+                current_line += 1
+            elif line.startswith("-"):
+                changes.append(("remove", line[1:], current_line, ""))
+            else:
+                current_line += 1
 
         return changes
 
     def apply_diff(self, file_path: str, diff_content: str) -> str:
-        """Apply a diff to a file and return the resulting content"""
+        """Improved apply_diff with better handling of complex changes"""
         try:
-            with open(file_path, "r") as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
         except FileNotFoundError:
             lines = []
+        except UnicodeDecodeError:
+            try:
+                with open(file_path, "r", encoding="latin-1") as f:
+                    lines = f.readlines()
+            except Exception as e:
+                logger.error(f"Failed to read file {file_path}: {str(e)}")
+                return ""
 
-        # Remove trailing newlines while preserving empty lines
-        lines = [line.rstrip("\n") + "\n" for line in lines]
+        # Normalize line endings
+        lines = [line.rstrip("\r\n") + "\n" for line in lines]
 
-        # Parse and apply the changes
+        # Parse and apply changes
         changes = self.parse_unified_diff(diff_content)
-        offset = 0  # Track line number changes as we modify the file
 
-        for change_type, content, line_num in changes:
-            adjusted_line = line_num + offset
-            if change_type == "add":
-                if adjusted_line >= len(lines):
-                    lines.append(content + "\n")
-                else:
-                    lines.insert(adjusted_line, content + "\n")
-                offset += 1
-            elif change_type == "remove":
-                if 0 <= adjusted_line < len(lines):
-                    lines.pop(adjusted_line)
-                    offset -= 1
+        # Sort changes by line number in reverse order to avoid offset issues
+        changes.sort(key=lambda x: x[2], reverse=True)
+
+        for change_type, content, line_num, _ in changes:
+            try:
+                if change_type == "add":
+                    if line_num >= len(lines):
+                        lines.append(content + "\n")
+                    else:
+                        lines.insert(line_num, content + "\n")
+                elif change_type == "remove":
+                    if 0 <= line_num < len(lines):
+                        lines.pop(line_num)
+            except Exception as e:
+                logger.error(f"Failed to apply change at line {line_num}: {str(e)}")
+                continue
 
         return "".join(lines)
 
@@ -601,16 +527,92 @@ Please provide fixed changes that will execute successfully. Respond in the same
         return "\n".join(diff) if diff else ""
 
     def implement_changes(self, changes: List[dict]) -> List[dict]:
+        """Improved implement_changes with better error handling and atomic operations"""
         results = []
+        temp_files = {}  # Store temporary changes before committing
+
+        # First pass: Parse all changes into temp_files
+        for change in changes:
+            if change["action"] in ["create", "modify"]:
+                path = os.path.join(self.codebase_directory, change["path"])
+                if "content" in change:
+                    if change["action"] == "create":
+                        # For create action, use content directly
+                        temp_files[path] = change["content"]
+                    else:
+                        # For modify action, parse the unified diff content
+                        lines = change["content"].splitlines()
+                        file_content = []
+                        current_line = 0
+
+                        # Skip the header lines (---, +++)
+                        header_count = 0
+                        i = 0
+                        while header_count < 2 and i < len(lines):
+                            if lines[i].startswith("---") or lines[i].startswith("+++"):
+                                header_count += 1
+                            i += 1
+
+                        # Process the diff hunks
+                        while i < len(lines):
+                            line = lines[i]
+                            if line.startswith("@@"):
+                                # Parse the hunk header
+                                match = re.match(
+                                    r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line
+                                )
+                                if match:
+                                    current_line = int(match.group(1)) - 1
+                            elif line.startswith("+"):
+                                file_content.insert(current_line, line[1:])
+                                current_line += 1
+                            elif line.startswith("-"):
+                                # Skip removed lines
+                                pass
+                            elif not line.startswith(
+                                "\\"
+                            ):  # Ignore "No newline" markers
+                                file_content.insert(current_line, line)
+                                current_line += 1
+                            i += 1
+
+                        temp_files[path] = "\n".join(file_content)
+                else:
+                    logger.error(
+                        f"No content provided for {change['action']} action on {path}"
+                    )
+                    results.append(
+                        {
+                            "action": change["action"],
+                            "path": path,
+                            "status": "error",
+                            "message": "No content provided",
+                        }
+                    )
+
+        # Second pass: Validate all changes can be applied
+        for path, content in temp_files.items():
+            if not content and os.path.exists(path):
+                logger.error(f"Failed to generate valid content for {path}")
+                results.append(
+                    {
+                        "action": "modify",
+                        "path": path,
+                        "status": "error",
+                        "message": "Failed to generate valid content",
+                    }
+                )
+                return results
+
+        # Third pass: Actually implement the changes
         for change in changes:
             action = change["action"]
             try:
-                if action == "create":
+                if action in ["create", "modify"]:
                     path = os.path.join(self.codebase_directory, change["path"])
+                    content = temp_files[path]
                     os.makedirs(os.path.dirname(path), exist_ok=True)
-                    # Unescape content before writing
-                    content = change["content"].replace("\\n", "\n").replace('\\"', '"')
-                    with open(path, "w") as f:
+                    with open(path, "w", encoding="utf-8") as f:
                         f.write(content)
                     self.codebase_embeddings.update_embeddings(path, content)
                     results.append(
@@ -618,42 +620,9 @@ Please provide fixed changes that will execute successfully. Respond in the same
                             "action": action,
                             "path": path,
                             "status": "success",
-                            "diff": self.generate_diff(path, content),
+                            "diff": change.get("content", ""),
                         }
                     )
-
-                elif action == "modify":
-                    path = os.path.join(self.codebase_directory, change["path"])
-                    if not os.path.exists(path):
-                        results.append(
-                            {
-                                "action": action,
-                                "path": path,
-                                "status": "error",
-                                "message": "File not found",
-                            }
-                        )
-                        continue
-
-                    # Unescape the diff content before applying
-                    diff_content = (
-                        change["content"].replace("\\n", "\n").replace('\\"', '"')
-                    )
-                    new_content = self.apply_diff(path, diff_content)
-
-                    with open(path, "w") as f:
-                        f.write(new_content)
-
-                    self.codebase_embeddings.update_embeddings(path, new_content)
-                    results.append(
-                        {
-                            "action": action,
-                            "path": path,
-                            "status": "success",
-                            "diff": change["content"],  # Keep escaped version for JSON
-                        }
-                    )
-
                 elif action == "delete":
                     path = os.path.join(self.codebase_directory, change["path"])
                     if os.path.exists(path):
@@ -668,10 +637,9 @@ Please provide fixed changes that will execute successfully. Respond in the same
                                 "action": action,
                                 "path": path,
                                 "status": "error",
-                                "message": "File not found",
+                                "message": "File does not exist",
                             }
                         )
-
                 elif action == "execute":
                     command = change["command"]
                     result = subprocess.run(
@@ -690,9 +658,8 @@ Please provide fixed changes that will execute successfully. Respond in the same
                             "status": "success",
                         }
                     )
-
             except Exception as e:
-                logger.error(f"Error implementing change {action}: {str(e)}")
+                logger.error(f"Error implementing {action}: {str(e)}")
                 results.append(
                     {
                         "action": action,
@@ -701,6 +668,19 @@ Please provide fixed changes that will execute successfully. Respond in the same
                         "message": str(e),
                     }
                 )
+                # Rollback any changes made so far
+                for path, content in temp_files.items():
+                    if os.path.exists(path):
+                        try:
+                            with open(path, "r", encoding="utf-8") as f:
+                                original = f.read()
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write(original)
+                        except Exception as rollback_error:
+                            logger.error(
+                                f"Error during rollback: {str(rollback_error)}"
+                            )
+                return results
 
         return results
 
@@ -720,6 +700,10 @@ Ghost can also process and analyze images provided in the conversation. When ima
 
 </role>
 
+<context>
+If you need information about the codebase to better answer a question, you can request it by responding with a JSON that includes "needs_context": true. The system will then provide relevant code snippets from the project.
+</context>
+
 <format>
 
 Ghost outputs its response in the form of a JSON object with the following structure:
@@ -738,18 +722,41 @@ Ghost outputs its response in the form of a JSON object with the following struc
     "summary": "A summary of the response or changes implemented"
 }
 
+For code-related queries, when modifying files, the content should be in a unified diff format:
+- Start with '---' and '+++' headers showing the file being modified
+- Include @@ markers to indicate the location of changes
+- Use '-' for removed lines and '+' for added lines
+- Preserve context lines without markers
+
+Example diff format:
+{
+    "action": "modify", 
+    "path": "example.py",
+    "content": ""
+        --- example.py
+        +++ example.py
+        @@ -10,7 +10,7 @@
+         def existing_function():
+        -    old_code = 'remove'
+        +    new_code = 'add'
+             other_code()
+        ""
+}
+
+
 </format>
 
 <important>
+Try to implement the changes in the current working directory.
+For example - for a query like "Can you setup a react app in the current working directory?", run a command like "npx create-react-app ." instead of a command like "npx create-react-app <app-name>"
+
 Leave the changes array empty for non-code related tasks such as - "Can you write a detailed background about this project?" or "What technologies does this project use?". In case of questions like these respond in the "markdown" key of the JSON object without executing changes.
 </important>
 
 <notes>
-For programming based tasks always include a execute method at the end which tests if the project works with the implemented changes.
-
 For code-related queries:
 - Use the 'create', 'modify', or 'delete' actions for file operations.
-- Use the 'execute' action when a command needs to be run, typically to test or run the program.
+- Use the 'execute' action when a command needs to be run.
 - For 'modify' actions, use a diff-like format in the 'content' field.
 
 For non-code-related queries:
@@ -781,7 +788,7 @@ def initialize_rag_application(repo_or_dir, *, is_local=False, local_dir="repo")
 
         asyncio.run(clone_repo())
 
-    project_id = "YOUR_GCP_PROJECT_ID"
+    project_id = "YOUR-GCP-PROJECT"
     region = "europe-west1"
 
     return RAGApplication(str(repo_path), project_id, region)
@@ -858,6 +865,8 @@ if prompt := st.chat_input("What would you like to know?"):
                     embedder=embedder,
                 )
 
+                logger.info(relevant)
+
                 response = st.session_state.rag_app.answer_question(
                     f"{prompt}\n\n Here is the relevant context you would need about the project-\n {relevant}\n\n Note: The relevant context is provided in form of a list of tuples. Each tuple has 3 values in this specific order - (<path to the file>, <content of the file>, <relevance of the file in the range 0-1>)",
                     images,
@@ -865,7 +874,7 @@ if prompt := st.chat_input("What would you like to know?"):
                 )
 
                 try:
-                    response_json = extract_json(response, strict=False)
+                    response_json = extract_json(response)
                     if isinstance(response_json, dict) and "changes" in response_json:
                         try:
                             st.write(response_json["markdown"])
@@ -874,6 +883,7 @@ if prompt := st.chat_input("What would you like to know?"):
                             st.json(response_json)
 
                         st.json(response_json)
+                        logger.info(f"Answer Question Method: {response_json}")
                         with st.spinner("Implementing changes..."):
                             results = st.session_state.rag_app.implement_changes(
                                 response_json["changes"]
